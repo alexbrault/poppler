@@ -80,11 +80,12 @@ ImageOutputDev::~ImageOutputDev() {
   }
 }
 
-void ImageOutputDev::setFilename(const char *fileExt) {
+void ImageOutputDev::setFilename(const char *fileExt, bool isMask=false) {
+  if (isMask) imgNum--;
   if (pageNames) {
-    sprintf(fileName, "%s-%03d-%03d.%s", fileRoot, pageNum, imgNum, fileExt);
+    sprintf(fileName, "%s-%03d-%05d.%s", fileRoot, pageNum, imgNum, fileExt);
   } else {
-    sprintf(fileName, "%s-%03d.%s", fileRoot, imgNum, fileExt);
+    sprintf(fileName, "%s-%05d.%s", fileRoot, imgNum, fileExt);
   }
 }
 
@@ -349,7 +350,7 @@ void ImageOutputDev::writeRawImage(Stream *str, const char *ext) {
 }
 
 void ImageOutputDev::writeImageFile(ImgWriter *writer, ImageFormat format, const char *ext,
-                                    Stream *str, int width, int height, GfxImageColorMap *colorMap) {
+                                    Stream *str, int width, int height, GfxImageColorMap *colorMap, bool isMask=false) {
   FILE *f = nullptr; /* squelch bogus compiler warning */
   ImageStream *imgStr = nullptr;
   unsigned char *row;
@@ -362,7 +363,7 @@ void ImageOutputDev::writeImageFile(ImgWriter *writer, ImageFormat format, const
   int invert_bits;
 
   if (writer) {
-    setFilename(ext);
+    setFilename(ext, isMask);
     ++imgNum;
     if (!(f = fopen(fileName, "wb"))) {
       error(errIO, -1, "Couldn't open image file '{0:s}'", fileName);
@@ -507,9 +508,97 @@ void ImageOutputDev::writeImageFile(ImgWriter *writer, ImageFormat format, const
   }
 }
 
+void ImageOutputDev::writeMaskedImageFile(ImgWriter *writer, ImageFormat format, const char *ext,
+					    Stream *str, int width, int height, GfxImageColorMap *colorMap,
+					    Stream *maskStr, int maskWidth, int maskHeight) {
+  FILE *f = nullptr; /* squelch bogus compiler warning */
+  ImageStream *imgStr = nullptr;
+  unsigned char *row;
+  unsigned char *rowp;
+  unsigned char *p;
+  GfxRGB rgb;
+  GfxGray gray;
+  unsigned char zero[gfxColorMaxComps];
+  int invert_bits;
+
+  if (writer) {
+    setFilename(ext);
+    ++imgNum;
+    if (!(f = fopen(fileName, "wb"))) {
+      error(errIO, -1, "Couldn't open image file '{0:s}'", fileName);
+      return;
+    }
+
+    if (!writer->init(f, width, height, 72, 72)) {
+      error(errIO, -1, "Error writing '{0:s}'", fileName);
+      return;
+    }
+  }
+
+  if (format != imgMonochrome) {
+    // initialize stream
+    imgStr = new ImageStream(str, width, colorMap->getNumPixelComps(),
+                             colorMap->getBits());
+    imgStr->reset();
+  } else {
+    // initialize stream
+    str->reset();
+  }
+  maskStr->reset();
+
+  int pixelSize = sizeof(unsigned int);
+
+  row = (unsigned char *) gmallocn(width, pixelSize);
+
+  // PDF masks use 0 = draw current color, 1 = leave unchanged.
+  // We invert this to provide the standard interpretation of alpha
+  // (0 = transparent, 1 = opaque). If the colorMap already inverts
+  // the mask we leave the data unchanged.
+  invert_bits = 0xff;
+  if (colorMap) {
+    memset(zero, 0, sizeof(zero));
+    colorMap->getGray(zero, &gray);
+    if (colToByte(gray) == 0)
+      invert_bits = 0x00;
+  }
+
+  // for each line...
+  for (int y = 0; y < height; y++) {
+      p = imgStr->getLine();
+      rowp = row;
+      for (int x = 0; x < width; ++x) {
+        if (p) {
+          colorMap->getRGB(p, &rgb);
+          *rowp++ = colToByte(rgb.r);
+          *rowp++ = colToByte(rgb.g);
+          *rowp++ = colToByte(rgb.b);
+          p += colorMap->getNumPixelComps();
+        } else {
+          *rowp++ = 0;
+          *rowp++ = 0;
+          *rowp++ = 0;
+        }
+        *rowp++ = maskStr->getChar() ^ invert_bits;
+      }
+      if (writer)
+	writer->writeRow(&row);
+  }
+
+  gfree(row);
+  if (format != imgMonochrome) {
+    imgStr->close();
+    delete imgStr;
+  }
+  str->close();
+  if (writer) {
+    writer->close();
+    fclose(f);
+  }
+}
+
 void ImageOutputDev::writeImage(GfxState *state, Object *ref, Stream *str,
 				int width, int height,
-				GfxImageColorMap *colorMap, bool inlineImg) {
+				GfxImageColorMap *colorMap, bool inlineImg, bool isMask=false) {
   ImageFormat format;
   EmbedStream *embedStr;
 
@@ -615,7 +704,7 @@ void ImageOutputDev::writeImage(GfxState *state, Object *ref, Stream *str,
       format = imgRGB;
     }
 
-    writeImageFile(writer, format, "png", str, width, height, colorMap);
+    writeImageFile(writer, format, "png", str, width, height, colorMap, isMask);
 
     delete writer;
 #endif
@@ -674,6 +763,47 @@ void ImageOutputDev::writeImage(GfxState *state, Object *ref, Stream *str,
       embedStr->restore();
 }
 
+void ImageOutputDev::writeImageMasked(GfxState *state, Object *ref, Stream *str,
+				int width, int height,
+				GfxImageColorMap *colorMap, 
+				Stream *maskStr, int maskWidth, int maskHeight) {
+  ImageFormat format;
+
+  if (outputPNG && !(outputTiff && colorMap &&
+                            (colorMap->getColorSpace()->getMode() == csDeviceCMYK ||
+                             (colorMap->getColorSpace()->getMode() == csICCBased &&
+                              colorMap->getNumPixelComps() == 4)))) {
+    // output in PNG format
+
+#ifdef ENABLE_LIBPNG
+    ImgWriter *writer;
+    writer = new PNGWriter(PNGWriter::RGBA);
+    format = imgRGB;
+
+    writeMaskedImageFile(writer, format, "png", str, width, height, colorMap, maskStr, maskWidth, maskHeight);
+
+    delete writer;
+#endif
+  } else {
+    // output in PPM/PBM format
+    ImgWriter *writer;
+
+    if (!colorMap || (colorMap->getNumPixelComps() == 1 && colorMap->getBits() == 1)) {
+      writer = new NetPBMWriter(NetPBMWriter::MONOCHROME);
+      format = imgMonochrome;
+    } else {
+      writer = new NetPBMWriter(NetPBMWriter::RGB);
+      format = imgRGB;
+    }
+
+    writeImageFile(writer, format,
+                   format == imgRGB ? "ppm" : "pbm",
+                   str, width, height, colorMap);
+
+    delete writer;
+  }
+}
+
 bool ImageOutputDev::tilingPatternFill(GfxState *state, Gfx *gfx, Catalog *cat, Object *str,
 				  const double *pmat, int paintType, int tilingType, Dict *resDict,
 				  const double *mat, const double *bbox,
@@ -710,8 +840,8 @@ void ImageOutputDev::drawMaskedImage(
     listImage(state, ref, str, width, height, colorMap, interpolate, false, imgImage);
     listImage(state, ref, str, maskWidth, maskHeight, nullptr, maskInterpolate, false, imgMask);
   } else {
-    writeImage(state, ref, str, width, height, colorMap, false);
-    writeImage(state, ref, maskStr, maskWidth, maskHeight, nullptr, false);
+    writeImageMasked(state, ref, str, width, height, colorMap, maskStr, maskWidth, maskHeight);
+    //writeImage(state, ref, maskStr, maskWidth, maskHeight, nullptr, false, true);
   }
 }
 
@@ -724,7 +854,7 @@ void ImageOutputDev::drawSoftMaskedImage(
     listImage(state, ref, str, width, height, colorMap, interpolate, false, imgImage);
     listImage(state, ref, maskStr, maskWidth, maskHeight, maskColorMap, maskInterpolate, false, imgSmask);
   } else {
-    writeImage(state, ref, str, width, height, colorMap, false);
-    writeImage(state, ref, maskStr, maskWidth, maskHeight, maskColorMap, false);
+    writeImageMasked(state, ref, str, width, height, colorMap, maskStr, maskWidth, maskHeight);
+    //writeImage(state, ref, maskStr, maskWidth, maskHeight, maskColorMap, false, true);
   }
 }

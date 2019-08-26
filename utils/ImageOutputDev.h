@@ -145,17 +145,23 @@ public:
 
 private:
   // Sets the output filename with a given file extension
-  void setFilename(const char *fileExt);
+  void setFilename(const char *fileExt, bool isMask);
   void listImage(GfxState *state, Object *ref, Stream *str,
 		 int width, int height,
 		 GfxImageColorMap *colorMap,
 		 bool interpolate, bool inlineImg,
 		 ImageType imageType);
   void writeImage(GfxState *state, Object *ref, Stream *str,
-                  int width, int height, GfxImageColorMap *colorMap, bool inlineImg);
+                  int width, int height, GfxImageColorMap *colorMap, bool inlineImg, bool isMask);
+  void writeImageMasked(GfxState *state, Object *ref, Stream *str,
+                  int width, int height, GfxImageColorMap *colorMap, 
+                      Stream *maskStr, int maskWidth, int maskHeight);
   void writeRawImage(Stream *str, const char *ext);
   void writeImageFile(ImgWriter *writer, ImageFormat format, const char *ext,
-                      Stream *str, int width, int height, GfxImageColorMap *colorMap);
+                      Stream *str, int width, int height, GfxImageColorMap *colorMap, bool isMask);
+  void writeMaskedImageFile(ImgWriter *writer, ImageFormat format, const char *ext,
+                      Stream *str, int width, int height, GfxImageColorMap *colorMap,
+                      Stream *maskStr, int maskWidth, int maskHeight);
   long getInlineImageLength(Stream *str, int width, int height, GfxImageColorMap *colorMap);
 
   char *fileRoot;		// root of output file names
